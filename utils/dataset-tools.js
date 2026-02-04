@@ -38,6 +38,8 @@ function parseArgs() {
       }
     } else if (args[i] === '-y') {
       options.yes = true
+    } else if (args[i] === '--all') {
+      options.all = true
     }
   }
 
@@ -87,14 +89,95 @@ function formatDataSet(dataSet) {
 
 // Handle terminate command
 async function handleTerminate(synapse, options) {
-  const dataSetIds = parseDataSetIds(options)
+  let targetDataSets = []
 
-  if (dataSetIds.length === 0) {
-    console.error('Error: No dataset IDs provided. Use --id <id> or --ids <id,id,...>')
-    process.exit(1)
+  // Check for --all flag
+  if (options.all) {
+    if (!synapse.client.account) {
+      console.error('Error: signer address required for --all. Please provide --key.')
+      process.exit(1)
+    }
+    const address = synapse.client.account.address
+    console.log(`Fetching all datasets for ${address}...`)
+    try {
+      const currentBlock = await synapse.client.getBlockNumber()
+      const allDataSets = await synapse.storage.findDataSets(address)
+      
+      console.log(`Current Block: ${currentBlock}`)
+      console.log(`Total Datasets Found: ${allDataSets.length}`)
+
+      // Filter out expired datasets
+      targetDataSets = allDataSets.filter(ds => {
+          if (ds.pdpEndEpoch === 0n) return true 
+          return ds.pdpEndEpoch > currentBlock
+      })
+      
+      const activeCount = targetDataSets.filter(ds => ds.pdpEndEpoch === 0n).length
+      const futureTerminatedCount = targetDataSets.length - activeCount
+      
+      const expiredCount = allDataSets.length - targetDataSets.length
+      console.log(`Filtering results:`)
+      console.log(`- Expired (already terminated & past): ${expiredCount}`)
+      console.log(`- Active (no end epoch): ${activeCount}`)
+      console.log(`- Terminated but valid (end epoch > current): ${futureTerminatedCount}`)
+      console.log(`- TOTAL to process: ${targetDataSets.length}`)
+
+      if (targetDataSets.length > 0) {
+          console.log(`Sample filtered datasets (first 5):`)
+          targetDataSets.slice(0, 5).forEach(ds => {
+              console.log(`  ID #${ds.pdpVerifierDataSetId}, EndEpoch: ${ds.pdpEndEpoch}, Provider: ${ds.providerId}`)
+          })
+      }
+      
+    } catch (error) {
+       console.error(`Error fetching datasets: ${error.message}`)
+       process.exit(1)
+    }
+  } else {
+    // Parse IDs
+    const dataSetIds = parseDataSetIds(options)
+    if (dataSetIds.length === 0) {
+      console.error('Error: No dataset IDs provided. Use --id <id>, --ids <id,id,...> or --all')
+      process.exit(1)
+    }
+
+    // We need providerId to create context. Converting IDs to dataset info.
+    // For provided IDs, we need to fetch info to get the provider ID.
+    // The most efficient way usually is to findDataSets and filter, 
+    // unless there is a direct getDataSet method exposed easily.
+    // synapse.storage.findDataSets gets everything for the client.
+    
+    if (!synapse.client.account) {
+        console.error('Error: signer required to fetch dataset details.')
+        process.exit(1)
+    }
+    const address = synapse.client.account.address
+    console.log(`Fetching dataset details for ${address}...`)
+    try {
+        const allDataSets = await synapse.storage.findDataSets(address)
+        const idSet = new Set(dataSetIds.map(id => BigInt(id)))
+        targetDataSets = allDataSets.filter(ds => idSet.has(ds.pdpVerifierDataSetId))
+        
+        // check if any were missed
+        const foundIds = new Set(targetDataSets.map(ds => ds.pdpVerifierDataSetId))
+        const missed = dataSetIds.filter(id => !foundIds.has(BigInt(id)))
+        if (missed.length > 0) {
+            console.warn(`Warning: Could not find details for dataset IDs: ${missed.join(', ')} (skipping)`)
+        }
+    } catch (error) {
+        console.error(`Error fetching dataset details: ${error.message}`)
+        process.exit(1)
+    }
   }
 
-  console.log(`\nDatasets to terminate: ${dataSetIds.join(', ')}`)
+  if (targetDataSets.length === 0) {
+    console.log('No matching datasets found.')
+    process.exit(0)
+  }
+
+  console.log(`\nDatasets to process: ${targetDataSets.length}`)
+  targetDataSets.forEach(ds => console.log(formatDataSet(ds)))
+
 
   // Confirm unless --yes is provided
   if (!options.yes) {
@@ -105,7 +188,7 @@ async function handleTerminate(synapse, options) {
     })
 
     const answer = await new Promise((resolve) => {
-      rl.question(`\nAre you sure you want to terminate ${dataSetIds.length} dataset(s)? [y/N] `, resolve)
+      rl.question(`\nAre you sure you want to delete pieces and terminate ${targetDataSets.length} dataset(s)? [y/N] `, resolve)
     })
     rl.close()
 
@@ -122,15 +205,78 @@ async function handleTerminate(synapse, options) {
     failed: [],
   }
 
-  for (const dataSetIdStr of dataSetIds) {
-    const dataSetId = BigInt(dataSetIdStr)
-    console.log(`Terminating dataset #${dataSetId}...`)
+  for (const ds of targetDataSets) {
+    const dataSetId = ds.pdpVerifierDataSetId
+    console.log(`Processing dataset #${dataSetId} (Provider: ${ds.providerId})...`)
+    
     try {
-      const txHash = await synapse.storage.terminateDataSet(dataSetId)
-      console.log(`  Transaction sent: ${txHash}`)
-      results.success.push(dataSetId)
+        // 1. Create Storage Context
+        // We use the specific provider ID from the dataset details
+        const context = await synapse.storage.createContext({
+            dataSetId: dataSetId,
+            providerId: ds.providerId
+        })
+
+        // 2. Delete Pieces
+        console.log(`  Fetching pieces...`)
+        // getPieces returns an async generator
+        let piecesDeleted = 0
+        const CONCURRENCY_LIMIT = 20
+        let activeDeletions = []
+        
+        try {
+            for await (const piece of context.getPieces()) {
+                const deletePromise = (async () => {
+                    console.log(`  Deleting piece ${piece.pieceCid}...`)
+                    try {
+                        await context.deletePiece(piece.pieceCid)
+                        piecesDeleted++
+                    } catch (err) {
+                        console.warn(`  Warning during piece deletion: ${err.message}`)
+                    }
+                })()
+
+                activeDeletions.push(deletePromise)
+
+                if (activeDeletions.length >= CONCURRENCY_LIMIT) {
+                    await Promise.race(activeDeletions)
+                    // Remove completed promises (simplistic approach, or just wait for one slot)
+                    // Better approach: filter out completed ones.
+                    // Actually, for simplicity with robust error handling:
+                    await Promise.all(activeDeletions)
+                    activeDeletions = []
+                }
+            }
+            // Wait for remaining
+            await Promise.all(activeDeletions)
+            
+        } catch (err) {
+            console.warn(`  Warning during piece listing/deletion: ${err.message}`)
+        }
+        
+        if (piecesDeleted > 0) {
+            console.log(`  Deleted ${piecesDeleted} pieces.`)
+        } else {
+            console.log(`  No active pieces found.`)
+        }
+
+        // 3. Terminate Dataset
+        // Only terminate if it's not already terminated?
+        // The user said "if it hasn't expired, execute it". 
+        // pdpEndEpoch > 0 means it is terminated (or at least has an end epoch set).
+        // Usually 0 means active/indefinite.
+        if (ds.pdpEndEpoch === 0n) {
+             console.log(`  Terminating dataset...`)
+             const txHash = await synapse.storage.terminateDataSet(dataSetId)
+             console.log(`  Termination transaction: ${txHash}`)
+        } else {
+            console.log(`  Dataset already terminated (End Epoch: ${ds.pdpEndEpoch}). Skipping termination.`)
+        }
+
+        results.success.push(dataSetId)
+
     } catch (error) {
-      console.error(`  Error: ${error.message}`)
+      console.error(`  Error processing dataset #${dataSetId}: ${error.message}`)
       results.failed.push({ id: dataSetId, error: error.message })
     }
   }
@@ -138,10 +284,10 @@ async function handleTerminate(synapse, options) {
   // Summary
   console.log('\n--- Summary ---')
   if (results.success.length > 0) {
-    console.log(`Successfully terminated: ${results.success.join(', ')}`)
+    console.log(`Successfully processed: ${results.success.join(', ')}`)
   }
   if (results.failed.length > 0) {
-    console.log(`Failed to terminate:`)
+    console.log(`Failed to process:`)
     for (const { id, error } of results.failed) {
       console.log(`  #${id}: ${error}`)
     }
@@ -208,6 +354,7 @@ Global Options:
   --key <private-key>       Private key for signing (required for terminate)
 
 Terminate Options:
+  --all                     Terminate ALL datasets for the signer
   --id <dataset-id>         Dataset ID to terminate (can be repeated)
   --ids <id,id,id>          Comma-separated list of dataset IDs
   --yes, -y                 Skip confirmation prompt
@@ -224,6 +371,9 @@ Examples:
 
   # Terminate with multiple --id flags
   npx tsx utils/dataset-tools.js terminate --key 0x... --id 123 --id 456 --id 789
+
+  # Terminate ALL datasets (delete pieces + terminate)
+  npx tsx utils/dataset-tools.js terminate --key 0x... --all
 
   # Terminate on mainnet (skip confirmation)
   npx tsx utils/dataset-tools.js terminate --key 0x... --id 123 --network mainnet -y
@@ -281,7 +431,7 @@ async function main() {
   // Manually create client and Synapse instance to avoid Synapse.create bug with undefined account
   const client = createClient({
     chain,
-    transport: rpcUrl ? http(rpcUrl) : http(),
+    transport: rpcUrl ? http(rpcUrl, { timeout: 60_000 }) : http(undefined, { timeout: 60_000 }),
     account
   })
 
