@@ -214,7 +214,8 @@ async function handleTerminate(synapse, options) {
         // We use the specific provider ID from the dataset details
         const context = await synapse.storage.createContext({
             dataSetId: dataSetId,
-            providerId: ds.providerId
+            providerId: ds.providerId,
+            withCDN: ds.withCDN
         })
 
         // 2. Delete Pieces
