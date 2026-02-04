@@ -126,7 +126,7 @@ async function handleTerminate(synapse, options) {
     const dataSetId = BigInt(dataSetIdStr)
     console.log(`Terminating dataset #${dataSetId}...`)
     try {
-      const txHash = await synapse.terminateDataSet(dataSetId)
+      const txHash = await synapse.storage.terminateDataSet(dataSetId)
       console.log(`  Transaction sent: ${txHash}`)
       results.success.push(dataSetId)
     } catch (error) {
@@ -166,7 +166,7 @@ async function handleList(synapse, options) {
   console.log(`\nFetching datasets for address: ${address}`)
 
   try {
-    const dataSets = (await synapse.findDataSets(address)).slice() // Copy to sort
+    const dataSets = (await synapse.storage.findDataSets(address)).slice() // Copy to sort
 
     if (dataSets.length === 0) {
       console.log('\nNo datasets found for this address.')
