@@ -24,9 +24,11 @@
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
+    "@filoz/synapse-sdk": "workspace:*",
     "knip": "^5.71.0",
     "markdownlint-cli2": "^0.20.0",
     "typescript": "catalog:",
+    "viem": "catalog:",
     "wireit": "^0.14.12"
   },
   "simple-git-hooks": {
